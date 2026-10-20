@@ -30,7 +30,7 @@ used, and its cap is respected.
 ## Local check
 
 ```powershell
-python tests/check_contract.py
+node tests/check-contract.mjs
 ```
 
 ## Why GenLayer is central
