@@ -13,6 +13,9 @@ required = [
     "hashlib.sha256",
     "exception_already_used",
     "action_hash_mismatch",
+    "_canonical_action",
+    "_registrable_domain",
+    "two_independent_registrable_domains_required",
     "amount_exceeds_receipt_cap",
     "only_requester_can_consume",
 ]
@@ -23,5 +26,8 @@ if missing:
 
 if "% 1000000007" in text:
     raise SystemExit("legacy non-cryptographic commitment detected")
+
+if "two_independent_hosts_required" in text:
+    raise SystemExit("host-only source diversity check detected")
 
 print("PolicyExceptionReceipt contract checks passed")

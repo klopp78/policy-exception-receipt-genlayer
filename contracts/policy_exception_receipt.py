@@ -31,33 +31,31 @@ class PolicyExceptionReceipt(gl.Contract):
         self,
         policy_id: str,
         action: str,
-        action_hash: str,
         max_amount: u64,
         expires_at: u64,
         evidence_urls: DynArray[str],
     ) -> str:
         normalized_policy = _text(policy_id, "policy_id", 3, 120)
         normalized_action = _text(action, "action", 20, 800)
-        normalized_action_hash = _digest(action_hash, "action_hash")
         amount = int(max_amount)
         expiry = int(expires_at)
         if amount <= 0:
             raise Exception("max_amount_must_be_positive")
         if expiry <= _now():
             raise Exception("expiry_must_be_in_future")
+        canonical_action = _canonical_action(normalized_policy, normalized_action, amount, expiry)
+        canonical_action_json = _canonical_json(canonical_action)
+        # The reviewed action commitment is always derived by the contract.
+        normalized_action_hash = _sha256(canonical_action_json)
 
         urls = _urls([item for item in evidence_urls])
         manifest = _manifest(urls)
-        if len({item["host"] for item in manifest}) < 2:
-            raise Exception("two_independent_hosts_required")
+        if len({item["source_identity"] for item in manifest}) < 2:
+            raise Exception("two_independent_registrable_domains_required")
 
         request_hash = _sha256_parts([
-            "policy_exception_receipt.v1",
-            normalized_policy,
-            normalized_action,
+            "policy_exception_receipt.v2",
             normalized_action_hash,
-            str(amount),
-            str(expiry),
             _canonical_json(manifest),
         ])
 
@@ -95,7 +93,8 @@ class PolicyExceptionReceipt(gl.Contract):
                 and proposed["request_hash"] == independent["request_hash"]
                 and proposed["snapshot_hashes"] == independent["snapshot_hashes"]
                 and proposed["snapshot_bundle_hash"] == independent["snapshot_bundle_hash"]
-                and proposed["evidence_hosts"] == independent["evidence_hosts"]
+                and proposed["action_hash"] == independent["action_hash"]
+                and proposed["evidence_source_identities"] == independent["evidence_source_identities"]
                 and abs(proposed["confidence"] - independent["confidence"]) <= 12
             )
 
@@ -104,12 +103,14 @@ class PolicyExceptionReceipt(gl.Contract):
         sequence = int(self.exception_count)
         exception_id = "exc_" + _sha256_parts([request_hash, str(sequence)])[:20]
         record = {
-            "schema_version": "policy_exception_receipt.v1",
+            "schema_version": "policy_exception_receipt.v2",
             "exception_id": exception_id,
             "sequence": sequence,
             "requester": str(gl.message.sender_address).lower(),
             "policy_id": normalized_policy,
             "action": normalized_action,
+            "canonical_action": canonical_action,
+            "canonical_action_json": canonical_action_json,
             "action_hash": normalized_action_hash,
             "max_amount": amount,
             "expires_at": expiry,
@@ -118,7 +119,7 @@ class PolicyExceptionReceipt(gl.Contract):
             "decision": result["decision"],
             "confidence": result["confidence"],
             "rationale": result["rationale"],
-            "evidence_hosts": result["evidence_hosts"],
+            "evidence_source_identities": result["evidence_source_identities"],
             "snapshot_hashes": result["snapshot_hashes"],
             "snapshot_bundle_hash": result["snapshot_bundle_hash"],
             "used": False,
@@ -129,7 +130,7 @@ class PolicyExceptionReceipt(gl.Contract):
         return exception_id
 
     @gl.public.write
-    def consume_exception(self, exception_id: str, action_hash: str, amount: u64) -> str:
+    def consume_exception(self, exception_id: str, action: str, amount: u64) -> str:
         record = _record(self.exceptions.get(exception_id, ""))
         if str(gl.message.sender_address).lower() != record["requester"]:
             raise Exception("only_requester_can_consume")
@@ -139,7 +140,11 @@ class PolicyExceptionReceipt(gl.Contract):
             raise Exception("exception_already_used")
         if _now() > int(record["expires_at"]):
             raise Exception("exception_expired")
-        if _digest(action_hash, "action_hash") != record["action_hash"]:
+        normalized_action = _text(action, "action", 20, 800)
+        expected_hash = _sha256(_canonical_json(_canonical_action(
+            str(record["policy_id"]), normalized_action, int(record["max_amount"]), int(record["expires_at"]),
+        )))
+        if expected_hash != record["action_hash"]:
             raise Exception("action_hash_mismatch")
         if int(amount) <= 0 or int(amount) > int(record["max_amount"]):
             raise Exception("amount_exceeds_receipt_cap")
@@ -169,23 +174,24 @@ def _assess(policy_id, action, action_hash, amount, expiry, urls, manifest, requ
         hashes.append(snapshot_hash)
         snapshots.append({
             "source_index": index + 1,
-            "host": manifest[index]["host"],
+            "source_identity": manifest[index]["source_identity"],
             "readable": readable,
             "snapshot_hash": snapshot_hash,
             "text": text,
         })
 
     bundle_hash = _sha256_parts([request_hash, _canonical_json(hashes)])
-    readable_hosts = sorted({item["host"] for item in snapshots if item["readable"]})
-    if len(readable_hosts) < 2:
+    readable_identities = sorted({item["source_identity"] for item in snapshots if item["readable"]})
+    if len(readable_identities) < 2:
         return _canonical_json({
             "decision": "deny",
             "confidence": 100,
             "rationale": "At least two independent readable sources are required.",
-            "evidence_hosts": readable_hosts,
+            "evidence_source_identities": readable_identities,
             "snapshot_hashes": hashes,
             "snapshot_bundle_hash": bundle_hash,
             "request_hash": request_hash,
+            "action_hash": action_hash,
         })
 
     prompt = f"""
@@ -214,10 +220,11 @@ Return minified JSON only: decision (approve|deny), confidence (0-100), and rati
         "decision": decision,
         "confidence": confidence,
         "rationale": rationale,
-        "evidence_hosts": readable_hosts,
+        "evidence_source_identities": readable_identities,
         "snapshot_hashes": hashes,
         "snapshot_bundle_hash": bundle_hash,
         "request_hash": request_hash,
+        "action_hash": action_hash,
     })
 
 
@@ -232,11 +239,14 @@ def _parse_result(raw: str) -> dict:
     hashes = item.get("snapshot_hashes", [])
     if not isinstance(hashes, list) or len(hashes) < 2 or any(not _is_digest(str(value)) for value in hashes):
         raise Exception("invalid_snapshot_hashes")
-    for field in ("snapshot_bundle_hash", "request_hash"):
+    for field in ("snapshot_bundle_hash", "request_hash", "action_hash"):
         if not _is_digest(str(item.get(field, ""))):
             raise Exception("invalid_commitment")
     item["confidence"] = int(item["confidence"])
-    item["evidence_hosts"] = sorted([str(value) for value in item.get("evidence_hosts", [])])
+    identities = item.get("evidence_source_identities", [])
+    if not isinstance(identities, list) or len(identities) > len(hashes):
+        raise Exception("invalid_evidence_source_identities")
+    item["evidence_source_identities"] = sorted([str(value) for value in identities])
     return item
 
 
@@ -261,7 +271,17 @@ def _urls(raw_urls: typing.Sequence[str]) -> typing.Sequence[str]:
 
 
 def _manifest(urls: typing.Sequence[str]) -> typing.Sequence[dict]:
-    return [{"source_index": index + 1, "url": url, "host": _host(url), "url_hash": _sha256(url)} for index, url in enumerate(urls)]
+    return [{"source_index": index + 1, "url": url, "host": _host(url), "source_identity": _registrable_domain(_host(url)), "url_hash": _sha256(url)} for index, url in enumerate(urls)]
+
+
+def _canonical_action(policy_id: str, action: str, max_amount: int, expires_at: int) -> dict:
+    return {
+        "action": action,
+        "expires_at": expires_at,
+        "max_amount": max_amount,
+        "policy_id": policy_id,
+        "schema": "policy_exception_receipt.action.v2",
+    }
 
 
 def _host(url: str) -> str:
@@ -269,6 +289,25 @@ def _host(url: str) -> str:
     if "." not in host or len(host) > 253:
         raise Exception("invalid_source_host")
     return host
+
+
+def _registrable_domain(host: str) -> str:
+    """Maps apex, www, and sibling subdomains to one source identity."""
+    labels = host.strip(".").lower().split(".")
+    if len(labels) < 2 or any(not label for label in labels):
+        raise Exception("invalid_source_host")
+    two_label_suffixes = {
+        "ac.uk", "co.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk", "nhs.uk", "org.uk",
+        "com.au", "edu.au", "gov.au", "id.au", "net.au", "org.au",
+        "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+        "com.br", "net.br", "org.br", "com.cn", "net.cn", "org.cn",
+        "com.hk", "net.hk", "org.hk", "com.my", "net.my", "org.my",
+        "com.mx", "com.sg", "net.sg", "org.sg", "co.nz", "org.nz",
+    }
+    suffix_size = 2 if ".".join(labels[-2:]) in two_label_suffixes else 1
+    if len(labels) <= suffix_size:
+        raise Exception("invalid_registrable_domain")
+    return ".".join(labels[-(suffix_size + 1):])
 
 
 def _text(raw: str, field: str, minimum: int, maximum: int) -> str:
